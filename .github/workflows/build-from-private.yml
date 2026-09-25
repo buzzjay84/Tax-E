@@ -1,14 +1,26 @@
 name: Build Release from private source
 
-# Lives in the PUBLIC release repo (buzzjay84/Tax-E), not in the private source repo. A copy is kept
-# in the private source at .github/release-repo/build-from-private.yml. Actions on a
-# public repository are free, so the installers are built here. The private source
-# (jaybhee84/Tax-E) is checked out read-only with a deploy key, tested, built, and the installers
-# are published to THIS repo's Releases.
+# Lives in the PUBLIC release repo (buzzjay84/Tax-E) as
+# .github/workflows/build-from-private.yml. A copy is kept in the private
+# source at .github/release-repo/build-from-private.yml. Actions on a public
+# repository are free, so the installers are built here. The private source
+# (jaybhee84/Tax-E) is checked out read-only with a deploy key, tested, built,
+# and the installers are published to THIS repo's Releases.
 #
-# Start it from the private repo's machine (no Actions needed there):
-#   gh workflow run build-from-private.yml -R buzzjay84/Tax-E -f tag=v1.0.0 -f ref=main
-# or from the Actions tab of this repo ("Run workflow").
+# Started by watch-private.yml when the private source's version changes, or
+# by hand:
+#   gh workflow run build-from-private.yml -R buzzjay84/Tax-E -f tag=v1.0.3 -f ref=v1.0.3
+#
+# One tag, one release (as in iSwabe): create-release makes a single draft
+# release first; the Windows, macOS Intel and macOS Apple Silicon builds run in
+# parallel and each uploads its own files into that same release, whichever
+# finishes first; publish-release makes it public only after all succeed.
+#
+# macOS: each architecture is built on its own runner from a fresh checkout,
+# so node_modules (and the encrypted SQLite driver, a native module) is never
+# shared between architectures. Before the DMG is uploaded, `lipo` and `file`
+# must show the Electron executable and better_sqlite3.node built for the
+# same, expected architecture, or the build fails.
 
 on:
   workflow_dispatch:
@@ -48,17 +60,11 @@ jobs:
             exit 1
           fi
 
-  # One release for both platforms. It is created here, once, as a draft
-  # BEFORE the builds start; the Windows and macOS builds run in parallel and
-  # both upload into this same release, whichever finishes first.
-  # publish-release makes it public only after both have succeeded.
-  # (When each build created the release itself, both saw "release doesn't
-  # exist" at the same moment and v1.0.2 was split into two releases.)
   create-release:
     needs: check-tag
     runs-on: ubuntu-latest
     steps:
-      - name: Create the draft release
+      - name: Create the one draft release all builds upload into
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -99,20 +105,34 @@ jobs:
             throw "Tag $env:RELEASE_TAG must match package.json version $packageVersion."
           }
 
-      # npm ci runs postinstall (electron-builder install-app-deps), which fetches the encrypted
-      # SQLite driver built for Electron on this platform.
       - run: npm ci
       - run: npm test
 
-      - name: Build and publish Windows installer
+      - name: Build Windows installer
+        run: npm run dist:win
+
+      - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run dist -- --win nsis --publish always
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" release/tax-e-setup-*.exe release/tax-e-setup-*.exe.blockmap release/latest.yml --repo "${{ github.repository }}" --clobber
 
   build-macos:
     needs: create-release
-    runs-on: macos-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Apple Silicon (M1–M5): built natively on an arm64 runner.
+          - arch: arm64
+            runner: macos-latest
+            lipo: arm64
+          # Intel: built natively on an Intel runner, so npm ci, the native
+          # module rebuild and Electron are all x86_64.
+          - arch: x64
+            runner: macos-15-intel
+            lipo: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out private source
         uses: actions/checkout@v4
@@ -125,7 +145,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+          architecture: ${{ matrix.arch }}
+          # No npm cache: nothing native is carried over between architectures.
 
       - name: Verify tag matches package version
         shell: bash
@@ -135,24 +156,83 @@ jobs:
             echo "Tag $RELEASE_TAG must match package.json version $PACKAGE_VERSION." >&2
             exit 1
           fi
+          echo "Runner $(uname -m), Node $(node -p process.arch), building ${{ matrix.arch }}"
 
+      # Fresh node_modules on this runner only.
       - run: npm ci
       - run: npm test
 
-      # No Apple certificate: unsigned, unnotarized DMGs (right-click > Open the first time).
-      # --x64 and --arm64 are both required to get both DMGs from one run; the SQLite driver is
-      # rebuilt for each architecture.
-      - name: Build and publish macOS DMGs
+      # Rebuild the encrypted SQLite driver for Electron (the version in
+      # package.json) and THIS architecture.
+      - name: Rebuild native modules for Electron ${{ matrix.arch }}
+        run: npx electron-builder install-app-deps --platform=darwin --arch=${{ matrix.arch }}
+
+      # No Apple certificate: unsigned, unnotarized DMG (right-click > Open the first time).
+      - name: Build the ${{ matrix.arch }} DMG
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run dist:mac:${{ matrix.arch }}
+
+      - name: Electron and better_sqlite3.node must both be ${{ matrix.lipo }}
+        shell: bash
+        run: |
+          APP=$(ls -d release/mac*/Tax-E.app | head -1)
+          EXE="$APP/Contents/MacOS/Tax-E"
+          NODE="$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node"
+          file "$EXE" "$NODE"
+          EXE_ARCH=$(lipo -archs "$EXE"); NODE_ARCH=$(lipo -archs "$NODE")
+          echo "Electron: $EXE_ARCH   better_sqlite3.node: $NODE_ARCH   expected: ${{ matrix.lipo }}"
+          if [ "$EXE_ARCH" != "${{ matrix.lipo }}" ] || [ "$NODE_ARCH" != "${{ matrix.lipo }}" ]; then
+            echo "::error::Architecture mismatch in the ${{ matrix.arch }} app (Electron $EXE_ARCH, better_sqlite3.node $NODE_ARCH, expected ${{ matrix.lipo }}). Not publishing." >&2
+            exit 1
+          fi
+          # The DMG itself: mount it and check the app inside, which is what users install.
+          DMG=$(ls release/Tax-E-mac-${{ matrix.arch }}.dmg)
+          MNT=$(mktemp -d)
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
+          DMG_EXE=$(lipo -archs "$MNT/Tax-E.app/Contents/MacOS/Tax-E")
+          DMG_NODE=$(lipo -archs "$MNT/Tax-E.app/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node")
+          hdiutil detach "$MNT" >/dev/null
+          echo "Inside $DMG: Electron $DMG_EXE, better_sqlite3.node $DMG_NODE"
+          if [ "$DMG_EXE" != "${{ matrix.lipo }}" ] || [ "$DMG_NODE" != "${{ matrix.lipo }}" ]; then
+            echo "::error::$DMG contains Electron $DMG_EXE with better_sqlite3.node $DMG_NODE (expected ${{ matrix.lipo }}). Not publishing." >&2
+            exit 1
+          fi
+
+      # Each job writes latest-mac.yml for its own DMG; publish-release merges
+      # the two so the update check sees both.
+      - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-        run: npm run dist -- --mac dmg --x64 --arm64 --publish always
+        shell: bash
+        run: |
+          cp release/latest-mac.yml "release/latest-mac-${{ matrix.arch }}.yml"
+          gh release upload "$RELEASE_TAG" "release/Tax-E-mac-${{ matrix.arch }}.dmg" "release/Tax-E-mac-${{ matrix.arch }}.dmg.blockmap" \
+            "release/latest-mac-${{ matrix.arch }}.yml" --repo "${{ github.repository }}" --clobber
 
   publish-release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
+      - name: Merge the macOS update files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --pattern 'latest-mac-*.yml' --dir mac
+          # Insert the arm64 entry into the x64 file's list of files.
+          node -e '
+            const fs = require("fs");
+            const x64 = fs.readFileSync("mac/latest-mac-x64.yml", "utf8"), arm = fs.readFileSync("mac/latest-mac-arm64.yml", "utf8");
+            const NL = String.fromCharCode(10);
+            const entries = s => s.slice(s.indexOf("files:" + NL) + 7, s.indexOf(NL + "path:")).trimEnd();
+            fs.writeFileSync("mac/latest-mac.yml", x64.replace(NL + "path:", NL + entries(arm) + NL + "path:"));
+          '
+          cat mac/latest-mac.yml
+          gh release upload "$RELEASE_TAG" mac/latest-mac.yml --repo "${{ github.repository }}" --clobber
+          gh release delete-asset "$RELEASE_TAG" latest-mac-x64.yml --repo "${{ github.repository }}" --yes
+          gh release delete-asset "$RELEASE_TAG" latest-mac-arm64.yml --repo "${{ github.repository }}" --yes
+
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
